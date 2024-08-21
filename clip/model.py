@@ -10,21 +10,21 @@ from torch import nn
 class Bottleneck(nn.Module):
     expansion = 4
 
-    def __init__(self, inplanes, planes, stride=1):
+    def __init__(self, inplanes, planes, stride=1): # inplanes为width
         super().__init__()
 
         # all conv layers have stride 1. an avgpool is performed after the second convolution when stride > 1
-        self.conv1 = nn.Conv2d(inplanes, planes, 1, bias=False)
+        self.conv1 = nn.Conv2d(inplanes, planes, 1, bias=False) # 修改channel数, inplanes=上一次planes*4, [(width,width), (4*width, 2*width), (8*width, 4*width), (16*width,8*width)]
         self.bn1 = nn.BatchNorm2d(planes)
         self.relu1 = nn.ReLU(inplace=True)
 
-        self.conv2 = nn.Conv2d(planes, planes, 3, padding=1, bias=False)
+        self.conv2 = nn.Conv2d(planes, planes, 3, padding=1, bias=False) # 保持高宽不变
         self.bn2 = nn.BatchNorm2d(planes)
         self.relu2 = nn.ReLU(inplace=True)
 
-        self.avgpool = nn.AvgPool2d(stride) if stride > 1 else nn.Identity()
+        self.avgpool = nn.AvgPool2d(stride) if stride > 1 else nn.Identity() # stride为1时，不进行平均池化
 
-        self.conv3 = nn.Conv2d(planes, planes * self.expansion, 1, bias=False)
+        self.conv3 = nn.Conv2d(planes, planes * self.expansion, 1, bias=False) # 扩成4倍的channel数
         self.bn3 = nn.BatchNorm2d(planes * self.expansion)
         self.relu3 = nn.ReLU(inplace=True)
 
@@ -43,21 +43,23 @@ class Bottleneck(nn.Module):
         identity = x
 
         out = self.relu1(self.bn1(self.conv1(x)))
-        out = self.relu2(self.bn2(self.conv2(out)))
-        out = self.avgpool(out)
-        out = self.bn3(self.conv3(out))
+        out = self.relu2(self.bn2(self.conv2(out))) # 原高宽，channel为planes
+        out = self.avgpool(out) # 高宽减半
+        out = self.bn3(self.conv3(out)) # channel变成4*planes
 
         if self.downsample is not None:
-            identity = self.downsample(x)
+            identity = self.downsample(x) # residual
 
-        out += identity
+        out += identity # residual在activation前进行的
         out = self.relu3(out)
         return out
 
 
 class AttentionPool2d(nn.Module):
+    # spaical_dim = input_size // 32, embed_dim=input_channel
     def __init__(self, spacial_dim: int, embed_dim: int, num_heads: int, output_dim: int = None):
         super().__init__()
+        # + 1 for the [CLS] token, / embed_dim ** 0.5 for scaling
         self.positional_embedding = nn.Parameter(torch.randn(spacial_dim ** 2 + 1, embed_dim) / embed_dim ** 0.5)
         self.k_proj = nn.Linear(embed_dim, embed_dim)
         self.q_proj = nn.Linear(embed_dim, embed_dim)
@@ -67,10 +69,10 @@ class AttentionPool2d(nn.Module):
 
     def forward(self, x):
         x = x.flatten(start_dim=2).permute(2, 0, 1)  # NCHW -> (HW)NC
-        x = torch.cat([x.mean(dim=0, keepdim=True), x], dim=0)  # (HW+1)NC
-        x = x + self.positional_embedding[:, None, :].to(x.dtype)  # (HW+1)NC
+        x = torch.cat([x.mean(dim=0, keepdim=True), x], dim=0)  # (HW+1)NC 第一个为均值
+        x = x + self.positional_embedding[:, None, :].to(x.dtype)  # (HW+1)NC, None 仅仅是为了增加一个维度
         x, _ = F.multi_head_attention_forward(
-            query=x[:1], key=x, value=x,
+            query=x[:1], key=x, value=x, # query为第一个CLS token，key和value为所有token
             embed_dim_to_check=x.shape[-1],
             num_heads=self.num_heads,
             q_proj_weight=self.q_proj.weight,
@@ -87,8 +89,8 @@ class AttentionPool2d(nn.Module):
             use_separate_proj_weight=True,
             training=self.training,
             need_weights=False
-        )
-        return x.squeeze(0)
+        ) # 1NC
+        return x.squeeze(0) # NC
 
 
 class ModifiedResNet(nn.Module):
@@ -105,31 +107,32 @@ class ModifiedResNet(nn.Module):
         self.input_resolution = input_resolution
 
         # the 3-layer stem
-        self.conv1 = nn.Conv2d(3, width // 2, kernel_size=3, stride=2, padding=1, bias=False)
+        self.conv1 = nn.Conv2d(3, width // 2, kernel_size=3, stride=2, padding=1, bias=False) # 高宽减半
         self.bn1 = nn.BatchNorm2d(width // 2)
-        self.relu1 = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv2d(width // 2, width // 2, kernel_size=3, padding=1, bias=False)
+        self.relu1 = nn.ReLU(inplace=True) # 不重新创建一个张量
+        self.conv2 = nn.Conv2d(width // 2, width // 2, kernel_size=3, padding=1, bias=False) # 保持高宽不变
         self.bn2 = nn.BatchNorm2d(width // 2)
         self.relu2 = nn.ReLU(inplace=True)
         self.conv3 = nn.Conv2d(width // 2, width, kernel_size=3, padding=1, bias=False)
         self.bn3 = nn.BatchNorm2d(width)
         self.relu3 = nn.ReLU(inplace=True)
-        self.avgpool = nn.AvgPool2d(2)
+        self.avgpool = nn.AvgPool2d(2) # 2*2 的平均池化
 
         # residual layers
         self._inplanes = width  # this is a *mutable* variable used during construction
-        self.layer1 = self._make_layer(width, layers[0])
-        self.layer2 = self._make_layer(width * 2, layers[1], stride=2)
-        self.layer3 = self._make_layer(width * 4, layers[2], stride=2)
-        self.layer4 = self._make_layer(width * 8, layers[3], stride=2)
+        self.layer1 = self._make_layer(width, layers[0]) # 高宽不变，width * 4
+        self.layer2 = self._make_layer(width * 2, layers[1], stride=2) # 高宽减半，channel=width*2*4
+        self.layer3 = self._make_layer(width * 4, layers[2], stride=2) # 高宽减半，channel=width*4*4
+        self.layer4 = self._make_layer(width * 8, layers[3], stride=2) # 高宽减半，channel=width*8*4
 
         embed_dim = width * 32  # the ResNet feature dimension
-        self.attnpool = AttentionPool2d(input_resolution // 32, embed_dim, heads, output_dim)
+        self.attnpool = AttentionPool2d(input_resolution // 32, embed_dim, heads, output_dim) # heads为width的1/2
 
     def _make_layer(self, planes, blocks, stride=1):
-        layers = [Bottleneck(self._inplanes, planes, stride)]
+        # _inplanes为width， planes为width的倍数
+        layers = [Bottleneck(self._inplanes, planes, stride)] # 这里面会进行residual
 
-        self._inplanes = planes * Bottleneck.expansion
+        self._inplanes = planes * Bottleneck.expansion # 4 * planes
         for _ in range(1, blocks):
             layers.append(Bottleneck(self._inplanes, planes))
 
@@ -148,8 +151,8 @@ class ModifiedResNet(nn.Module):
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
-        x = self.layer4(x)
-        x = self.attnpool(x)
+        x = self.layer4(x) # 高宽减半^3，channel=width*8*4
+        x = self.attnpool(x) # NC
 
         return x
 
@@ -172,7 +175,7 @@ class ResidualAttentionBlock(nn.Module):
     def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None):
         super().__init__()
 
-        self.attn = nn.MultiheadAttention(d_model, n_head)
+        self.attn = nn.MultiheadAttention(d_model, n_head) # d_model=width
         self.ln_1 = LayerNorm(d_model)
         self.mlp = nn.Sequential(OrderedDict([
             ("c_fc", nn.Linear(d_model, d_model * 4)),
@@ -196,7 +199,7 @@ class Transformer(nn.Module):
     def __init__(self, width: int, layers: int, heads: int, attn_mask: torch.Tensor = None):
         super().__init__()
         self.width = width
-        self.layers = layers
+        self.layers = layers 
         self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)])
 
     def forward(self, x: torch.Tensor):
@@ -208,10 +211,10 @@ class VisionTransformer(nn.Module):
         super().__init__()
         self.input_resolution = input_resolution
         self.output_dim = output_dim
-        self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
+        self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False) # 得到每个patch * width
 
         scale = width ** -0.5
-        self.class_embedding = nn.Parameter(scale * torch.randn(width))
+        self.class_embedding = nn.Parameter(scale * torch.randn(width)) # cls token
         self.positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size) ** 2 + 1, width))
         self.ln_pre = LayerNorm(width)
 
@@ -221,14 +224,14 @@ class VisionTransformer(nn.Module):
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
     def forward(self, x: torch.Tensor):
-        x = self.conv1(x)  # shape = [*, width, grid, grid]
+        x = self.conv1(x)  # shape = [*, width, grid, grid] grid为input // patch_size
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
         x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
         x = x + self.positional_embedding.to(x.dtype)
         x = self.ln_pre(x)
 
-        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = x.permute(1, 0, 2)  # NLD -> LND L为grid ** 2 + 1，D为width
         x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
 
@@ -329,9 +332,9 @@ class CLIP(nn.Module):
         # lazily create causal attention mask, with full attention between the vision tokens
         # pytorch uses additive attention mask; fill with -inf
         mask = torch.empty(self.context_length, self.context_length)
-        mask.fill_(float("-inf"))
+        mask.fill_(float("-inf")) 
         mask.triu_(1)  # zero out the lower diagonal
-        return mask
+        return mask # 得到一个上三角矩阵，且上三角为-inf，避免了未来信息泄露
 
     @property
     def dtype(self):
@@ -341,6 +344,7 @@ class CLIP(nn.Module):
         return self.visual(image.type(self.dtype))
 
     def encode_text(self, text):
+        # text shape = [batch_size, n_ctx]
         x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
 
         x = x + self.positional_embedding.type(self.dtype)
@@ -350,7 +354,7 @@ class CLIP(nn.Module):
         x = self.ln_final(x).type(self.dtype)
 
         # x.shape = [batch_size, n_ctx, transformer.width]
-        # take features from the eot embedding (eot_token is the highest number in each sequence)
+        # take features from the eot embedding (eot_token is the highest number in each sequence), end of text识别到</w>的位置
         x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
 
         return x
